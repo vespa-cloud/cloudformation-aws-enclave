@@ -1,0 +1,325 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: IAM roles and policies for provisioning in Vespa Cloud Enclave
+
+# =========================== #
+#   Provisioning Parameters   #
+# =========================== #
+
+Parameters:
+    Account:
+        Type: String
+        Description: AWS account that contains Vespa Cloud Enclave
+
+    VespaCloudAccount:
+        Type: String
+        Description: The account the Vespa Cloud provisioner resides in
+
+    TenantName:
+        Type: String
+        Description: The tenant owner running Enclave account
+
+# =========================== #
+#   Provisioning Resources    #
+# =========================== #
+
+Resources:
+    # =========================== #
+    #          IAM Roles          #
+    # =========================== #
+
+    # Main provisioning role
+    VespaCloudProvisionerRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: vespa-cloud-provisioner
+            Description: Allow config servers to provision resources
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          AWS: !Sub "arn:aws:iam::${VespaCloudAccount}:role/vespa-cloud-provisioner"
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - !Ref VespaCloudProvisionPolicy
+                - !Ref VespaCloudBackupExpiryPolicy
+            Tags:
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # Main tenant host role
+    VespaCloudTenantHostRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Description: Host role
+            RoleName: !Sub "vespa.tenant.${TenantName}.aws-${Account}.tenant-host"
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          AWS: !GetAtt VespaCloudTenantHostServiceRole.Arn
+                      Action: sts:AssumeRole
+            Tags:
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # Tenant host service role
+    VespaCloudTenantHostServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Description: Host service role that assumes host role
+            RoleName: !Sub "vespa.tenant.${TenantName}.aws-${Account}.tenant-host-service"
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: ec2.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                - !Ref VespaCloudHostPolicy
+                - !Ref VespaCloudHostBackupPolicy
+            Tags:
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # =========================== #
+    #     Provisioning policy     #
+    # =========================== #
+
+    VespaCloudProvisionPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            Description: Policy for Vespa Cloud provisioner with EC2, KMS, Route53, and ELB permissions
+            ManagedPolicyName: vespa-cloud-provisioner-policy
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    # Manage EC2 instances
+                    - Effect: Allow
+                      Action:
+                          - ec2:AttachVolume
+                          - ec2:CreateTags
+                          - ec2:CreateVolume
+                          - ec2:DeleteVolume
+                          - ec2:DetachVolume
+                          - ec2:ModifyInstanceAttribute
+                          - ec2:RunInstances
+                          - ec2:TerminateInstances
+                      Resource:
+                          - arn:aws:ec2:*:*:image/*
+                          - arn:aws:ec2:*:*:instance/*
+                          - arn:aws:ec2:*:*:network-interface/*
+                          - arn:aws:ec2:*:*:security-group/*
+                          - arn:aws:ec2:*:*:snapshot/*
+                          - arn:aws:ec2:*:*:subnet/*
+                          - arn:aws:ec2:*:*:volume/*
+                          - arn:aws:iam::*:role/*
+
+                    # Pass tenant host service role (defined above) to instances
+                    - Effect: Allow
+                      Action:
+                          - iam:PassRole
+                      Resource: !GetAtt VespaCloudTenantHostServiceRole.Arn
+
+                    # Key management service access and route 53
+                    - Effect: Allow
+                      Action:
+                          - kms:CreateGrant
+                          - kms:GenerateDataKeyWithoutPlaintext
+                          - kms:ReEncryptFrom
+                          - kms:ReEncryptTo
+                          - route53:ChangeResourceRecordSets
+                          - route53:GetChange
+                      Resource:
+                          - arn:aws:kms:*:*:key/*
+                          - arn:aws:route53:::change/*
+                          - arn:aws:route53:::hostedzone/*
+
+                    # Read and change route 53 records
+                    # This is probably wrong from old terraform
+                    - Effect: Allow
+                      Action:
+                          - route53:GetChange
+                          - route53:ChangeResourceRecordSets
+                      Resource:
+                          - arn:aws:ec2:*:*:image/*
+                          - arn:aws:ec2:*:*:instance/*
+                          - arn:aws:ec2:*:*:security-group/*
+                          - arn:aws:ec2:*:*:network-interface/*
+                          - arn:aws:ec2:*:*:subnet/*
+                          - arn:aws:ec2:*:*:volume/*
+
+                    # Elastic load balancer
+                    - Effect: Allow
+                      Action:
+                          - elasticloadbalancing:*
+                      Resource: "*"
+
+                    # Read/describe various resource states
+                    # From old terraform - should be reduced
+                    - Effect: Allow
+                      Action:
+                          - cognito-idp:DescribeUserPoolClient
+                          - ec2:AssignPrivateIpAddresses
+                          - ec2:CreateTags
+                          - ec2:CreateVpcEndpointServiceConfiguration
+                          - ec2:DeleteVpcEndpointServiceConfigurations
+                          - ec2:DescribeAccountAttributes
+                          - ec2:DescribeAddresses
+                          - ec2:DescribeClassicLinkInstances
+                          - ec2:DescribeCoipPools
+                          - ec2:DescribeImages
+                          - ec2:DescribeInstanceStatus
+                          - ec2:DescribeInstances
+                          - ec2:DescribeInternetGateways
+                          - ec2:DescribeNetworkInterfaces
+                          - ec2:DescribeRouteTables
+                          - ec2:DescribeSecurityGroups
+                          - ec2:DescribeSubnets
+                          - ec2:DescribeVolumes
+                          - ec2:DescribeVpcClassicLink
+                          - ec2:DescribeVpcEndpointConnections
+                          - ec2:DescribeVpcEndpointServiceConfigurations
+                          - ec2:DescribeVpcEndpointServicePermissions
+                          - ec2:DescribeVpcPeeringConnections
+                          - ec2:DescribeVpcs
+                          - ec2:GetCoipPoolUsage
+                          - ec2:ModifyVpcEndpointServiceConfiguration
+                          - ec2:ModifyVpcEndpointServicePermissions
+                          - ec2:StartInstances
+                          - ec2:StartVpcEndpointServicePrivateDnsVerification
+                          - kms:ListAliases
+                          - kms:ListKeys
+                          - route53:ListHostedZones
+                          - sts:AssumeRole
+                      Resource: "*"
+                    - Effect: Allow
+                      Action:
+                          - iam:CreateServiceLinkedRole
+                      Resource: "*"
+                      Condition:
+                          StringEquals:
+                              "iam:AWSServiceName": elasticloadbalancing.amazonaws.com
+
+    # =========================== #
+    #     Backup expiry policy    #
+    # =========================== #
+
+    VespaCloudBackupExpiryPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            ManagedPolicyName: vespa-cloud-backup-expiry-policy
+            Description: Policy for Vespa Cloud backup expiry operations
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Sid: ConfigServerAccess
+                      Effect: Allow
+                      Action:
+                          - s3:DeleteObject
+                      Resource: !Sub "arn:aws:s3:::backup-${Account}-*/*"
+                    - Sid: ConfigServerAccessList
+                      Effect: Allow
+                      Action:
+                          - s3:ListBucket
+                      Resource: !Sub "arn:aws:s3:::backup-${Account}-*"
+
+    # =========================== #
+    #     Enclave host policy     #
+    # =========================== #
+
+    VespaCloudHostPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            ManagedPolicyName: vespa-cloud-host-policy
+            Description: Policy for Vespa Cloud hosts with S3, KMS, and ECR permissions
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - s3:PutObject
+                          - s3:PutObjectTagging
+                      Resource: arn:aws:s3:::vespa-archive-*
+                    - Effect: Allow
+                      Action:
+                          - kms:GenerateDataKey
+                      Resource: "*"
+                      Condition:
+                          StringLike:
+                              "kms:ViaService": s3.*.amazonaws.com
+                    - Effect: Allow
+                      Action:
+                          - ecr:GetAuthorizationToken
+                      Resource: "*"
+                    - Effect: Allow
+                      Action:
+                          - ecr:BatchGetImage
+                          - ecr:GetDownloadUrlForLayer
+                      Resource: !Sub "arn:aws:ecr:*:${VespaCloudAccount}:repository/*"
+
+    # =========================== #
+    #       Backup policy         #
+    # =========================== #
+
+    VespaCloudHostBackupPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            ManagedPolicyName: vespa-cloud-host-backup-policy
+            Description: Policy for Vespa Cloud host backup operations
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Sid: TenantHostAccess
+                      Effect: Allow
+                      Action:
+                          - s3:PutObject
+                          - s3:GetObject
+                      Resource: !Sub "arn:aws:s3:::backup-${Account}-*/snapshots/*/*/*"
+                    - Sid: TenantHostAccessList
+                      Effect: Allow
+                      Action:
+                          - s3:ListBucket
+                      Resource: !Sub "arn:aws:s3:::backup-${Account}-*"
+                      Condition:
+                          StringLike:
+                              "s3:prefix":
+                                  - "snapshots/*/*/"
+                                  - "snapshots/*/*/*"
+
+    # =========================== #
+    #      Instance profile       #
+    # =========================== #
+
+    VespaCloudTenantHostServiceInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            InstanceProfileName: !Ref VespaCloudTenantHostServiceRole
+            Roles:
+                - !Ref VespaCloudTenantHostServiceRole
+
+# =========================== #
+#          Outputs            #
+# =========================== #
+
+Outputs:
+    VespaCloudProvisionerRoleArn:
+        Description: ARN of the Vespa Cloud Provisioner Role
+        Value: !GetAtt VespaCloudProvisionerRole.Arn
+        Export:
+            Name: !Sub "${AWS::StackName}-ProvisionerRoleArn"
+
+    VespaCloudTenantHostServiceRoleArn:
+        Description: ARN of the Vespa Cloud Tenant Host Service Role
+        Value: !GetAtt VespaCloudTenantHostServiceRole.Arn
+        Export:
+            Name: !Sub "${AWS::StackName}-TenantHostServiceRoleArn"
+
+    VespaCloudTenantHostRoleArn:
+        Description: ARN of the Vespa Cloud Tenant Host Role
+        Value: !GetAtt VespaCloudTenantHostRole.Arn
+        Export:
+            Name: !Sub "${AWS::StackName}-TenantHostRoleArn"

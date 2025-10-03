@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Vespa Cloud Enclave main template
+
+# =========================== #
+#     Enclave Parameters      #
+# =========================== #
+
+Parameters:
+    TenantName:
+        Type: String
+        Description: The tenant owner running enclave account
+
+    VespaCloudAccount:
+        Type: String
+        Default: "332934501266"
+        Description: The account the Vespa Cloud provisioner resides in
+
+    DefaultRegion:
+        Type: String
+        Default: "us-east-1"
+        Description: Region to default to when resources don't need to be in a specific region
+
+    # ====== Zone object ====== #
+
+    ZoneEnvironment:
+        Type: String
+        Description: Environment of the zone (dev, test, staging, perf, prod)
+        AllowedValues: [dev, test, staging, perf, prod]
+
+    ZoneRegion:
+        Type: String
+        Description: Region identifier for the zone (e.g., aws-us-east-1c)
+
+    ZoneName:
+        Type: String
+        Description: Name of the Vespa Cloud zone (e.g., prod.aws-us-east-1c)
+
+    ZoneTag:
+        Type: String
+        Description: Tag for the Vespa Cloud zone (e.g., prod.aws-use-1c)
+
+    ZoneAvailabilityZoneId:
+        Type: String
+        Description: Availability Zone ID for the zone (e.g., use1-az6)
+
+    ZoneTemplateVersion:
+        Type: String
+        Description: Zone template version for compatibility
+
+    # ====== Additional parameters ====== #
+
+    ZoneIPv4Cidr:
+        Type: String
+        Default: "10.128.0.0/16"
+        Description: IPv4 CIDR block for the zone VPC (must be /16 and within 10.0.0.0/8)
+
+# =========================== #
+#     Provisioning Stack      #
+# =========================== #
+
+Resources:
+    ProvisionStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: "./enclave-provision.yml"
+            Parameters:
+                Account: !Ref "AWS::AccountId"
+                VespaCloudAccount: !Ref VespaCloudAccount
+                TenantName: !Ref TenantName
+    ZoneStack:
+        Type: AWS::CloudFormation::Stack
+        DependsOn: ProvisionStack # ensure IAM/etc. exist first
+        Properties:
+            TemplateURL: ./enclave-zone.yml # rewritten by 'package'
+            Parameters:
+                # ====== Zone object ====== #
+                ZoneEnvironment: !Ref ZoneEnvironment
+                ZoneRegion: !Ref ZoneRegion
+                ZoneName: !Ref ZoneName
+                ZoneTag: !Ref ZoneTag
+                ZoneAvailabilityZoneId: !Ref ZoneAvailabilityZoneId
+                ZoneTemplateVersion: !Ref ZoneTemplateVersion
+                # ====== Additional ====== #
+                ZoneIPv4Cidr: !Ref ZoneIPv4Cidr
+                # ArchiveReaderPrincipals: !Ref ArchiveReaderPrincipals
+
+# =========================== #
+#          Outputs            #
+# =========================== #
+
+Outputs:
+    VespaCloudAccount:
+        Description: The Vespa Cloud AWS account used to manage enclave accounts
+        Value: !Ref VespaCloudAccount
+        Export:
+            Name: !Sub "${AWS::StackName}-VespaCloudAccount"
+
+# =========================== #
+#          Metadata           #
+# =========================== #
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            - Label:
+                  default: "Tenant & Account Settings"
+              Parameters:
+                  - TenantName
+                  - VespaCloudAccount
+                  - DefaultRegion
+
+            - Label:
+                  default: "Zone Configuration"
+              Parameters:
+                  - ZoneEnvironment
+                  - ZoneRegion
+                  - ZoneName
+                  - ZoneTag
+                  - ZoneAvailabilityZoneId
+                  - ZoneTemplateVersion
+
+            - Label:
+                  default: "Network Configuration"
+              Parameters:
+                  - ZoneIPv4Cidr
+
+            # - Label:
+            #       default: "Archive Access"
+            #   Parameters:
+            #       - ArchiveReaderPrincipals
+
+        ParameterLabels:
+            TenantName:
+                default: "Tenant Name"
+            VespaCloudAccount:
+                default: "Vespa Cloud Account ID"
+            DefaultRegion:
+                default: "Default Region"
+            ZoneEnvironment:
+                default: "Zone Environment"
+            ZoneRegion:
+                default: "Zone Region Identifier"
+            ZoneName:
+                default: "Zone Name"
+            ZoneTag:
+                default: "Zone Tag"
+            ZoneAvailabilityZoneId:
+                default: "Zone AZ ID"
+            ZoneTemplateVersion:
+                default: "Zone Template Version"
+            ZoneIPv4Cidr:
+                default: "Zone IPv4 CIDR"
+            # ArchiveReaderPrincipals:
+            #     default: "Archive Reader Principals"

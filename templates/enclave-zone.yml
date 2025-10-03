@@ -1,0 +1,805 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Zone template for Vespa Cloud Enclave (VPC, networking, security, storage)
+
+# =========================== #
+#       Zone Parameters       #
+# =========================== #
+
+Parameters:
+    # ====== Zone object ====== #
+
+    ZoneEnvironment:
+        Type: String
+        Description: Environment of the zone (dev, test, staging, perf, prod)
+        AllowedValues: [dev, test, staging, perf, prod]
+
+    ZoneRegion:
+        Type: String
+        Description: Region identifier for the zone (e.g., aws-us-east-1c)
+
+    ZoneName:
+        Type: String
+        Description: Name of the Vespa Cloud zone (e.g., prod.aws-us-east-1c)
+
+    ZoneTag:
+        Type: String
+        Description: Tag for the Vespa Cloud zone (e.g., prod.aws-use-1c)
+
+    ZoneAvailabilityZoneId:
+        Type: String
+        Description: Availability Zone ID for the zone (e.g., use1-az6)
+
+    ZoneTemplateVersion:
+        Type: String
+        Description: Zone template version for compatibility
+
+    # ====== Additional parameters ====== #
+
+    ZoneIPv4Cidr:
+        Type: String
+        Default: "10.128.0.0/16"
+        Description: IPv4 CIDR block for the zone VPC (must be /16 and within 10.0.0.0/8)
+
+# Indices for subnet carvings (see subnet section below)
+Mappings:
+    SubnetIndices:
+        v4-21:
+            host: 0
+        v4-24:
+            lb: 8 # Skip 8*256 = 2048, no overlap
+            natgw: 9 # Skip 9*256 = 2304, no overlap
+        v6-64:
+            host: 0
+            lb: 1
+            natgw: 2
+
+# =========================== #
+#        Zone Resources       #
+# =========================== #
+
+Resources:
+    # =========================== #
+    #          Main VPC           #
+    # =========================== #
+
+    VespaCloudVpc:
+        Type: AWS::EC2::VPC
+        Properties:
+            CidrBlock: !Ref ZoneIPv4Cidr
+            EnableDnsHostnames: true
+            Tags:
+                - Key: Name
+                  Value: !Ref ZoneTag # TODO from terraform: change to zone name
+                - Key: managedby
+                  Value: vespa-cloud
+                - Key: zone
+                  Value: !Ref ZoneName
+                - Key: vespa_template_version
+                  Value: !Ref ZoneTemplateVersion
+
+    # Request an AWS assigned IPv6 CIDR block for the VPC
+    # Equivalent to Terraform "assign_generated_ipv6_cidr_block = true"
+    VespaCloudVpcIPv6CidrBlock:
+        Type: AWS::EC2::VPCCidrBlock
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            AmazonProvidedIpv6CidrBlock: true
+
+    # =========================== #
+    #          Subnets            #
+    # =========================== #
+
+    # A zone in an external account should be assigned a subnet with prefix length 20, which does not overlap with any other
+    # subnets used by the zone (in any account). A unit test verifies that subnets do not overlap.
+    #
+    # The assigned prefix is further divided in the following networks:
+    #
+    # name   prefix   address count  usable count
+    # hosts  21       2048           2046
+    # lb     24       256            254
+    # natgw  24       256            254
+    #
+    # In practice we carve like this (range inclusive-exclusive):
+    #
+    # host:   A.B.[C+0].0/21 => 2048 addresses (A.B.[C+0].0 - A.B.[C+8 ].0)
+    # lb:     A.B.[C+8].0/24 =>  256 addresses (A.B.[C+8].0 - A.B.[C+9 ].0)
+    # natgw:  A.B.[C+9].0/24 =>  256 addresses (A.B.[C+9].0 - A.B.[C+10].0)
+
+    # ===== Host subnet ===== #
+    HostsSubnet:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            CidrBlock: !Select
+                - !FindInMap [SubnetIndices, v4-21, host]
+                - !Cidr [!Ref ZoneIPv4Cidr, 32, 5] # 16+5 = 21
+            Ipv6CidrBlock: !Select
+                - !FindInMap [SubnetIndices, v6-64, host]
+                - !Cidr [
+                      !Select [0, !GetAtt VespaCloudVpc.Ipv6CidrBlocks],
+                      256,
+                      64, # For IPv6 this argument is not prefix addition but TARGET prefix length...
+                  ] # 56 + 8 = 64
+            AvailabilityZoneId: !Ref ZoneAvailabilityZoneId
+            AssignIpv6AddressOnCreation: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneTag}-subnet-tenant" # TODO terraform: switch to zone name
+                - Key: managedby
+                  Value: vespa-cloud
+                - Key: zone
+                  Value: !Ref ZoneName
+                - Key: service
+                  Value: tenant
+
+    # ===== Load balancer subnet ===== #
+    LbSubnet:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            CidrBlock: !Select
+                - !FindInMap [SubnetIndices, v4-24, lb]
+                - !Cidr [!Ref ZoneIPv4Cidr, 256, 8] # 16+8 = 24
+            Ipv6CidrBlock: !Select
+                - !FindInMap [SubnetIndices, v6-64, lb]
+                - !Cidr [
+                      !Select [0, !GetAtt VespaCloudVpc.Ipv6CidrBlocks],
+                      256,
+                      64, # For IPv6 this argument is not prefix addition but TARGET prefix length...
+                  ] # 56 + 8 = 64
+            AvailabilityZoneId: !Ref ZoneAvailabilityZoneId
+            AssignIpv6AddressOnCreation: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneTag}-subnet-tenantelb" # TODO terraform: switch to zone name
+                - Key: managedby
+                  Value: vespa-cloud
+                - Key: zone
+                  Value: !Ref ZoneName
+                - Key: service
+                  Value: tenantelb
+
+    # ===== NAT Gateway subnet  ===== #
+    NatGwSubnet:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            CidrBlock: !Select
+                - !FindInMap [SubnetIndices, v4-24, natgw]
+                - !Cidr [!Ref ZoneIPv4Cidr, 256, 8] # 16+8 = 24
+            Ipv6CidrBlock: !Select
+                - !FindInMap [SubnetIndices, v6-64, natgw]
+                - !Cidr [
+                      !Select [0, !GetAtt VespaCloudVpc.Ipv6CidrBlocks],
+                      256,
+                      64, # For IPv6 this argument is not prefix addition but TARGET prefix length...
+                  ] # 56 + 8 = 64
+            AvailabilityZoneId: !Ref ZoneAvailabilityZoneId
+            AssignIpv6AddressOnCreation: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-subnet-natgw" # TODO terraform: switch to zone name
+                - Key: managedby
+                  Value: vespa-cloud
+                - Key: zone
+                  Value: !Ref ZoneName
+                - Key: service
+                  Value: natgw
+
+    # =========================== #
+    #          Gateway            #
+    # =========================== #
+
+    # ===== Internet Gateway ===== #
+    InternetGateway:
+        Type: AWS::EC2::InternetGateway
+        Properties:
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-igw"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # ===== Attach gateway to VPC ===== #
+    VpcGatewayAttachment:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            InternetGatewayId: !Ref InternetGateway
+
+    # ===== Elastic public IP for VPC ===== #
+    NatEip:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-eip-natgw"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # ===== NAT Gateway with EIP ===== #
+    NatGateway:
+        Type: AWS::EC2::NatGateway
+        DependsOn: VpcGatewayAttachment # ensure IGW is attached first
+        Properties:
+            AllocationId: !GetAtt NatEip.AllocationId
+            SubnetId: !Ref NatGwSubnet
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-natgw"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # =========================== #
+    #      Routing Tables         #
+    # =========================== #
+
+    # Configures routing for IP addresses in each subnet.
+    #
+    # Hosts:
+    #   - IPv4: 0.0.0.0/0   => NAT GW
+    #   - IPv6: ::/0        => IGW
+    # Load Balancer:
+    #   - IPv4: 0.0.0.0/0   => IGW
+    #   - IPv6: ::/0        => IGW
+    # NAT GW:
+    #   - IPv4: 0.0.0.0/0   => IGW
+
+    # ===== Host subnet routing table ===== #
+    HostsRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-rt"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # IPv4: 0.0.0.0/0 => NAT GW
+    HostsRouteIPv4Default:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref HostsRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+            NatGatewayId: !Ref NatGateway
+
+    # IPv6: ::/0 => Internet GW
+    HostsRouteIPv6Default:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref HostsRouteTable
+            DestinationIpv6CidrBlock: ::/0
+            GatewayId: !Ref InternetGateway
+
+    # Attach to hosts subnet
+    HostsRouteTableAssociation:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            SubnetId: !Ref HostsSubnet
+            RouteTableId: !Ref HostsRouteTable
+
+    # ===== Load balancer subnet routing table ===== #
+    LbRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-igw-rt"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # IPv4: 0.0.0.0/0 => IGW
+    LbRouteIPv4Default:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref LbRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+            GatewayId: !Ref InternetGateway
+
+    # IPv6: ::/0 => IGW
+    LbRouteIPv6Default:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref LbRouteTable
+            DestinationIpv6CidrBlock: ::/0
+            GatewayId: !Ref InternetGateway
+
+    # Attach to lb subnet
+    LbRouteTableAssociation:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            SubnetId: !Ref LbSubnet
+            RouteTableId: !Ref LbRouteTable
+
+    # ===== Nat gateway subnet routing table ===== #
+    NatgwRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-natgw-rt"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # IPv4: 0.0.0.0/0 => IGW
+    NatgwRouteIPv4Default:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref NatgwRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+            GatewayId: !Ref InternetGateway
+
+    # Attach to natgw subnet
+    NatgwRouteTableAssociation:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            SubnetId: !Ref NatGwSubnet
+            RouteTableId: !Ref NatgwRouteTable
+
+    # =========================== #
+    #        Network ACLs         #
+    # =========================== #
+
+    # Stateless network ACL with associated subnets (host, load balancer, natgw).
+    # Controls rules for inbound/outbound IPv4 and IPv6 traffic on different ports/protocols.
+    #
+    # Inbound Rules
+    #
+    # Source/Port   Protocol    IPv4    IPv6
+    # VPC           *           allow   allow
+    # 1024-65535    TCP         allow   allow
+    # 1024-65535    UCP         -       allow
+    # 433           TCP         allow   allow
+    # ICMPv4 (3/4)  ICMPv4      allow   -
+    #
+    # Outbound Rules (allows everything)
+    # Dest/Port     Protocol    IPv4    IPv6
+    # *             *           allow   allow
+
+    VespaNacl:
+        Type: AWS::EC2::NetworkAcl
+        Properties:
+            VpcId: !Ref VespaCloudVpc
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-nacl"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    HostsSubnetNaclAssociation:
+        Type: AWS::EC2::SubnetNetworkAclAssociation
+        Properties:
+            SubnetId: !Ref HostsSubnet
+            NetworkAclId: !Ref VespaNacl
+
+    LbSubnetNaclAssociation:
+        Type: AWS::EC2::SubnetNetworkAclAssociation
+        Properties:
+            SubnetId: !Ref LbSubnet
+            NetworkAclId: !Ref VespaNacl
+
+    NatGwSubnetNaclAssociation:
+        Type: AWS::EC2::SubnetNetworkAclAssociation
+        Properties:
+            SubnetId: !Ref NatGwSubnet
+            NetworkAclId: !Ref VespaNacl
+
+    # Inbound allow-all from VPC IPv4 CIDR
+    # All ports open inside VPC here, but limited by iptables on the host
+    NaclAllowInFromVpcIPv4:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 100
+            Protocol: -1 # all protocols
+            RuleAction: allow
+            Egress: false # inbound
+            CidrBlock: !GetAtt VespaCloudVpc.CidrBlock
+
+    # Inbound allow-all from VPC IPv6 CIDR
+    # All ports open inside VPC here, but limited by iptables on the host
+    NaclAllowInFromVpcIPv6:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 110
+            Protocol: -1 # all protocols
+            RuleAction: allow
+            Egress: false # inbound
+            Ipv6CidrBlock: !Select [0, !GetAtt VespaCloudVpc.Ipv6CidrBlocks]
+
+    # Inbound IPv4: allow TCP ephemeral ports from anywhere
+    NaclAllowInboundEphemeralIPv4:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 120
+            Protocol: 6 # TCP
+            RuleAction: allow
+            Egress: false # inbound
+            CidrBlock: 0.0.0.0/0
+            PortRange:
+                From: 1024
+                To: 65535
+
+    # Inbound IPv6: allow TCP ephemeral ports from anywhere
+    NaclAllowInboundEphemeralIPv6:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 130
+            Protocol: 6 # TCP
+            RuleAction: allow
+            Egress: false # inbound
+            Ipv6CidrBlock: ::/0
+            PortRange:
+                From: 1024
+                To: 65535
+
+    # Inbound IPv6: allow UDP ephemeral ports from anywhere
+    NaclAllowInboundUdpEphemeralIPv6:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 131
+            Protocol: 17 # UDP
+            RuleAction: allow
+            Egress: false # inbound
+            Ipv6CidrBlock: ::/0
+            PortRange:
+                From: 1024
+                To: 65535
+
+    # Inbound IPv4: allow HTTPS from anywhere
+    NaclAllowInboundHttpsIPv4:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 132
+            Protocol: 6 # TCP
+            RuleAction: allow
+            Egress: false # inbound
+            CidrBlock: 0.0.0.0/0
+            PortRange:
+                From: 443
+                To: 443
+
+    # Inbound IPv6: allow HTTPS from anywhere
+    NaclAllowInboundHttpsIPv6:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 134
+            Protocol: 6 # TCP
+            RuleAction: allow
+            Egress: false # inbound
+            Ipv6CidrBlock: ::/0
+            PortRange:
+                From: 443
+                To: 443
+
+    # Inbound IPv4: allow ICMPv4 from anywhere (unreachable/fragmentation needed)
+    NaclAllowInboundIcmpFragNeededIPv4:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 140
+            Protocol: 1 # ICMPv4
+            RuleAction: allow
+            Egress: false # inbound
+            CidrBlock: 0.0.0.0/0
+            Icmp:
+                Type: 3 # Destination Unreachable
+                Code: 4 # Fragmentation Needed (DF set)
+
+    # Outbound IPv4: allow all to anywhere
+    NaclAllowAllOutboundIPv4:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 100
+            Protocol: -1 # all protocols
+            RuleAction: allow
+            Egress: true # outbound
+            CidrBlock: 0.0.0.0/0
+
+    # Outbound IPv6: allow all to anywhere
+    NaclAllowAllOutboundIPv6:
+        Type: AWS::EC2::NetworkAclEntry
+        Properties:
+            NetworkAclId: !Ref VespaNacl
+            RuleNumber: 110
+            Protocol: -1 # all protocols
+            RuleAction: allow
+            Egress: true # outbound
+            Ipv6CidrBlock: ::/0
+
+    # =========================== #
+    #       Security Group        #
+    # =========================== #
+
+    VespaSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupName: !Sub "${ZoneName}-sg-hostedvpc"
+            GroupDescription: Vespa security group
+            VpcId: !Ref VespaCloudVpc
+            # Inbound IPv4/IPv6: allow all from VPC CIDR
+            SecurityGroupIngress:
+                - IpProtocol: -1
+                  CidrIp: !GetAtt VespaCloudVpc.CidrBlock
+                - IpProtocol: -1
+                  CidrIpv6: !Select [0, !GetAtt VespaCloudVpc.Ipv6CidrBlocks]
+            # Outbound IPv4/IPv6: allow all to anywhere
+            SecurityGroupEgress:
+                - IpProtocol: -1
+                  CidrIp: 0.0.0.0/0
+                - IpProtocol: -1
+                  CidrIpv6: ::/0
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ZoneName}-vpc-sg"
+                - Key: managedby
+                  Value: vespa-cloud
+                - Key: zone
+                  Value: !Ref ZoneName
+                - Key: service
+                  Value: hostedvpc
+
+    # =========================== #
+    #        VPC Endpoints        #
+    # =========================== #
+
+    # 6 interface endpoints
+    # 1 gateway endpoint (S3)
+
+    VpcEndpointEcrApi:
+        Type: AWS::EC2::VPCEndpoint
+        Properties:
+            VpcEndpointType: Interface
+            VpcId: !Ref VespaCloudVpc
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+            SubnetIds: [!Ref HostsSubnet]
+            SecurityGroupIds: [!Ref VespaSecurityGroup]
+            PrivateDnsEnabled: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "vespa-ecr-api-${ZoneName}"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    VpcEndpointEcrDkr:
+        Type: AWS::EC2::VPCEndpoint
+        Properties:
+            VpcEndpointType: Interface
+            VpcId: !Ref VespaCloudVpc
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+            SubnetIds: [!Ref HostsSubnet]
+            SecurityGroupIds: [!Ref VespaSecurityGroup]
+            PrivateDnsEnabled: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "vespa-ecr-dkr-${ZoneName}"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    VpcEndpointSsm:
+        Type: AWS::EC2::VPCEndpoint
+        Properties:
+            VpcEndpointType: Interface
+            VpcId: !Ref VespaCloudVpc
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+            SubnetIds: [!Ref HostsSubnet]
+            SecurityGroupIds: [!Ref VespaSecurityGroup]
+            PrivateDnsEnabled: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "vespa-ssm-${ZoneName}"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    VpcEndpointSsmmessages:
+        Type: AWS::EC2::VPCEndpoint
+        Properties:
+            VpcEndpointType: Interface
+            VpcId: !Ref VespaCloudVpc
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+            SubnetIds: [!Ref HostsSubnet]
+            SecurityGroupIds: [!Ref VespaSecurityGroup]
+            PrivateDnsEnabled: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "vespa-ssmmessages-${ZoneName}"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    VpcEndpointEc2messages:
+        Type: AWS::EC2::VPCEndpoint
+        Properties:
+            VpcEndpointType: Interface
+            VpcId: !Ref VespaCloudVpc
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+            SubnetIds: [!Ref HostsSubnet]
+            SecurityGroupIds: [!Ref VespaSecurityGroup]
+            PrivateDnsEnabled: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "vespa-ec2messages-${ZoneName}"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    VpcEndpointSts:
+        Type: AWS::EC2::VPCEndpoint
+        Properties:
+            VpcEndpointType: Interface
+            VpcId: !Ref VespaCloudVpc
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.sts"
+            SubnetIds: [!Ref HostsSubnet]
+            SecurityGroupIds: [!Ref VespaSecurityGroup]
+            PrivateDnsEnabled: true
+            Tags:
+                - Key: Name
+                  Value: !Sub "vespa-sts-${ZoneName}"
+                - Key: managedby
+                  Value: vespa-cloud
+
+    # Gateway endpoint
+    S3GatewayEndpoint:
+        Type: AWS::EC2::VPCEndpoint
+        Properties:
+            VpcEndpointType: Gateway
+            VpcId: !Ref VespaCloudVpc
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+            RouteTableIds: [!Ref HostsRouteTable]
+            Tags:
+                - Key: Name
+                  Value: !Sub "vespa-s3gw-${ZoneName}"
+                - Key: managedby
+                  Value: vespa-cloud
+                - Key: zone
+                  Value: !Ref ZoneName
+                - Key: service
+                  Value: s3
+
+    # =========================== #
+    #         EBS KMS Key         #
+    # =========================== #
+
+    EbsKmsKey:
+        Type: AWS::KMS::Key
+        Properties:
+            Description: Key used for EBS encryption on Vespa instances
+            KeyUsage: ENCRYPT_DECRYPT
+            EnableKeyRotation: true
+            PendingWindowInDays: 7
+            Tags:
+                - Key: managedby
+                  Value: vespa-cloud
+            KeyPolicy:
+                Version: "2012-10-17"
+                Statement:
+                    # Policy id and allow all for root
+                    - Sid: KeyDefault-1
+                      Effect: Allow
+                      Principal:
+                          AWS:
+                              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+                      Action:
+                          - kms:*
+                      Resource: "*"
+
+                    # Allow CreateGrant for AWS services
+                    - Sid: AllowCreateGrantForAWSResources
+                      Effect: Allow
+                      Principal:
+                          AWS:
+                              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+                      Action:
+                          - kms:CreateGrant
+                      Resource: "*"
+                      Condition:
+                          Bool:
+                              kms:GrantIsForAWSResource: "true"
+
+                    # Issuer ARN is not available in cloudformation (unless we do parameterized template).
+                    # - Sid: IssuerFullAccess
+                    #   Effect: Allow
+                    #   Principal:
+                    #       AWS: !Ref IssuerArn
+                    #   Action:
+                    #       - kms:*
+                    #   Resource: "*"
+
+    EbsKmsAlias:
+        Type: AWS::KMS::Alias
+        Properties:
+            AliasName: !Sub alias/vespa-ebs-key-${ZoneEnvironment}-${ZoneRegion}
+            TargetKeyId: !Ref EbsKmsKey
+
+    # =========================== #
+    #          S3 Backup          #
+    # =========================== #
+
+    BackupKmsKey:
+        Type: AWS::KMS::Key
+        Properties:
+            Description: KMS key for backup bucket
+            EnableKeyRotation: true
+            KeyPolicy:
+                Version: "2012-10-17"
+                Statement:
+                    - Sid: AllowAdministrationOfTheKey
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+                      Action:
+                          - kms:Create*
+                          - kms:Describe*
+                          - kms:Enable*
+                          - kms:List*
+                          - kms:Put*
+                          - kms:Update*
+                          - kms:Revoke*
+                          - kms:Disable*
+                          - kms:Get*
+                          - kms:Delete*
+                          - kms:ScheduleKeyDeletion
+                          - kms:CancelKeyDeletion
+                      Resource: "*"
+                    - Sid: AllowAccessThroughS3ForAccountPrincipals
+                      Effect: Allow
+                      Principal: "*"
+                      Action:
+                          - kms:Encrypt
+                          - kms:Decrypt
+                          - kms:ReEncrypt*
+                          - kms:CreateGrant
+                          - kms:DescribeKey
+                          - kms:GenerateDataKey
+                      Resource: "*"
+                      Condition:
+                          StringEquals:
+                              kms:CallerAccount: !Sub "${AWS::AccountId}"
+                          StringLike:
+                              kms:ViaService: "s3.*.amazonaws.com"
+
+    BackupBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Sub "backup-${AWS::AccountId}-${ZoneEnvironment}-${ZoneRegion}"
+            BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                    - ServerSideEncryptionByDefault:
+                          SSEAlgorithm: aws:kms
+                          KMSMasterKeyID: !Ref BackupKmsKey
+            LifecycleConfiguration:
+                Rules:
+                    - Id: remove-incomplete
+                      Status: Enabled
+                      AbortIncompleteMultipartUpload:
+                          DaysAfterInitiation: 2
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+
+    BackupBucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref BackupBucket
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Sid: RequiredSecureTransport
+                      Effect: Deny
+                      Principal: "*"
+                      Action: "s3:*"
+                      Resource: !Sub "arn:aws:s3:::${BackupBucket}/*"
+                      Condition:
+                          Bool:
+                              aws:SecureTransport: false
